@@ -36,6 +36,7 @@ const (
 
 // Node represents a file or directory
 type Node struct {
+	ID        string
 	Name      string
 	IsDir     bool
 	Children  []*Node
@@ -78,7 +79,7 @@ type Model struct {
 	vfs           *VFS
 	cursor        int
 	showingFile   bool
-	selectedFile  string
+	selectedFile  *Node
 	quitting      bool
 	searchMode    bool
 	searchQuery   string
@@ -94,6 +95,7 @@ type Model struct {
 	lastKey       string // Track last key for double-press detection
 	renameMode    bool   // When true, waiting for new name
 	renameText    string
+	db            *DB
 }
 
 // NewVFS creates a new virtual file system with the example structure
@@ -389,13 +391,42 @@ func processDateShortcut(text string) string {
 }
 
 func InitialModel() Model {
+	db, err := InitDB("file.db", "files")
+	if err != nil {
+		panic(err)
+	}
+
+	vfs, err := db.LoadVFSFromDB()
+	if err != nil {
+		panic(err)
+	}
+
 	return Model{
-		vfs:       NewVFS(),
+		vfs:       vfs,
 		cursor:    0,
 		sortBy:    SortByName,
 		sortAsc:   true,
 		clipboard: nil,
+		db:        db,
 	}
+}
+
+func checkName(name string, children []*Node) string {
+	for _, child := range children {
+		if child.Name == name {
+			baseName := name
+			// Check if it's a file, else directory
+			if strings.HasSuffix(baseName, ".do") {
+				baseName = baseName[:len(baseName)-3]
+				name = baseName + "_copy.do"
+			} else {
+				name = name + "_copy"
+			}
+			name = checkName(name, children)
+			break
+		}
+	}
+	return name
 }
 
 func (m Model) Init() {}
@@ -407,11 +438,15 @@ func (m Model) Update(key string) Model {
 			if m.renameText != "" {
 				items := m.getDisplayItems()
 				if m.cursor >= 0 && m.cursor < len(items) {
-					oldName := items[m.cursor].Name
-					// Process date shortcuts before saving
+					selected := items[m.cursor]
+					oldName := selected.Name
 					newName := processDateShortcut(m.renameText)
-					items[m.cursor].Name = newName
-					m.statusMessage = fmt.Sprintf("Renamed '%s' to '%s'", oldName, newName)
+
+					if err := m.db.RenameFile(selected.ID, newName); err != nil {
+						m.statusMessage = fmt.Sprintf("Error: %v", err)
+					} else {
+						m.statusMessage = fmt.Sprintf("Renamed '%s' to '%s'", oldName, newName)
+					}
 				}
 			}
 			m.renameMode = false
@@ -438,6 +473,7 @@ func (m Model) Update(key string) Model {
 			if m.newItemName != "" {
 				// Process date shortcuts before creating
 				finalName := processDateShortcut(m.newItemName)
+				finalName = checkName(finalName, m.vfs.Current.Children)
 
 				// Determine if it's a file or directory
 				isFile := strings.HasSuffix(finalName, ".do")
@@ -449,16 +485,27 @@ func (m Model) Update(key string) Model {
 					Modified:  1700001000,
 					Size:      0,
 				}
+
 				if !isFile {
 					newNode.Children = []*Node{}
 				}
-				m.vfs.Current.Children = append(m.vfs.Current.Children, newNode)
 
-				itemType := "folder"
-				if isFile {
-					itemType = "file"
+				// Get parent ID
+				var parentID *string
+				if m.vfs.Current.ID != "root" {
+					id := m.vfs.Current.ID
+					parentID = &id
 				}
-				m.statusMessage = fmt.Sprintf("Created %s: %s", itemType, finalName)
+				if err := m.db.CreateFile(newNode, parentID); err != nil {
+					m.statusMessage = fmt.Sprintf("Error: %v", err)
+				} else {
+					m.vfs.Current.Children = append(m.vfs.Current.Children, newNode)
+					itemType := "folder"
+					if isFile {
+						itemType = "file"
+					}
+					m.statusMessage = fmt.Sprintf("Created %s: %s", itemType, finalName)
+				}
 			}
 			m.newItemMode = false
 			m.newItemName = ""
@@ -636,7 +683,7 @@ func (m Model) Update(key string) Model {
 					m.statusMessage = "Cannot navigate to folders from search (press backspace to exit search)"
 				} else {
 					m.showingFile = true
-					m.selectedFile = selected.Name
+					m.selectedFile = selected
 				}
 			}
 			m.lastKey = key
@@ -690,7 +737,7 @@ func (m Model) Update(key string) Model {
 				}
 			} else {
 				m.showingFile = true
-				m.selectedFile = selected.Name
+				m.selectedFile = selected
 			}
 		}
 		m.lastKey = key
@@ -729,46 +776,26 @@ func (m Model) Update(key string) Model {
 		}
 		return m
 
-	func checkName(node *Node, children []Node) string {
-		exists := false
-		for _, child := range children {
-			if child.Name == node.Name {
-				baseName := nodeCopy.Name
-				if strings.HasSuffix(baseName, ".do") {
-					baseName = baseName[:len(baseName)-3]
-					nodeCopy.Name = baseName + "_copy.do"
-				} else {
-					nodeCopy.Name = nodeCopy.Name + "_copy"
-				}
-			}
-
-		}
-	}
-
 	case "P", "p":
 		// Paste file - clipboard persists for duplication
 		if m.clipboard != nil {
-			// Create a copy of the node
-			nodeCopy := *m.clipboard.Node
-
-			// Check if file with same name exists
-			exists := false
-			nodeCopy.Name = checkName(nodeCopy, m.vfs.Current.Children)
-
-			for _, child := range m.vfs.Current.Children {
-				if child.Name == nodeCopy.Name {
-					exists = true
-					break
-				}
+			var parentID *string
+			if m.vfs.Current.ID != "root" {
+				id := m.vfs.Current.ID
+				parentID = &id
 			}
 
-			// If exists and same directory, create with modified name
-			if exists {
+			nodeCopy := m.clipboard.Node
+			nodeCopy.Name = checkName(nodeCopy.Name, m.vfs.Current.Children)
+			newNode, err := m.db.CopyFile(nodeCopy, parentID, true)
+			if err != nil {
+				m.statusMessage = fmt.Sprintf("Error: %v", err)
+			} else {
+				// Add to current directory
+				// Check if file with same name exists
+				m.vfs.Current.Children = append(m.vfs.Current.Children, newNode)
+				m.statusMessage = fmt.Sprintf("Pasted: %s (clipboard persists)", nodeCopy.Name)
 			}
-
-			// Add to current directory
-			m.vfs.Current.Children = append(m.vfs.Current.Children, &nodeCopy)
-			m.statusMessage = fmt.Sprintf("Pasted: %s (clipboard persists)", nodeCopy.Name)
 		} else {
 			m.statusMessage = "Clipboard empty"
 		}
@@ -960,18 +987,12 @@ func (m Model) View() string {
 func (m Model) renderFileView() string {
 	var b strings.Builder
 
-	b.WriteString("\n")
-	b.WriteString(fmt.Sprintf("%s%s┌─────────────────────────────────────────────────────┐%s\n", Bold, Purple, Reset))
-	b.WriteString(fmt.Sprintf("%s%s│  File: %-43s│%s\n", Bold, Purple, m.selectedFile, Reset))
-	b.WriteString(fmt.Sprintf("%s%s├─────────────────────────────────────────────────────┤%s\n", Bold, Purple, Reset))
-	b.WriteString(fmt.Sprintf("%s%s│                                                     │%s\n", Bold, Purple, Reset))
-	b.WriteString(fmt.Sprintf("%s%s│  This is a virtual file system, so the actual      │%s\n", Bold, Purple, Reset))
-	b.WriteString(fmt.Sprintf("%s%s│  file content is not displayed here.               │%s\n", Bold, Purple, Reset))
-	b.WriteString(fmt.Sprintf("%s%s│                                                     │%s\n", Bold, Purple, Reset))
-	b.WriteString(fmt.Sprintf("%s%s│  Press any key to return to the browser...         │%s\n", Bold, Purple, Reset))
-	b.WriteString(fmt.Sprintf("%s%s│                                                     │%s\n", Bold, Purple, Reset))
-	b.WriteString(fmt.Sprintf("%s%s└─────────────────────────────────────────────────────┘%s\n", Bold, Purple, Reset))
-	b.WriteString("\n")
+	content, err := m.db.GetFileContent(m.selectedFile.ID)
+	if err != nil {
+		fmt.Printf("Error reading file: %v\n", err)
+	}
+
+	b.WriteString(content)
 
 	return b.String()
 }
@@ -1081,10 +1102,6 @@ func main() {
 
 	// Setup: alternate screen, hide cursor
 	fmt.Print("\033[?1049h\033[?25l")
-	defer func() {
-		fmt.Print("\033[?1049l\033[?25h")
-		fmt.Println("Goodbye!")
-	}()
 
 	model := InitialModel()
 	model.Init()
@@ -1100,4 +1117,15 @@ func main() {
 			model = model.Update(key)
 		}
 	}
+
+	if err := model.db.SaveVFSToDB(model.vfs); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving: %v\n", err)
+	}
+
+	if err := model.db.SaveDirectoryStates(model.vfs); err != nil {
+		fmt.Fprintf(os.Stderr, "Error saving states: %v\n", err)
+	}
+
+	fmt.Print("\033[?1049l\033[?25h")
+	fmt.Println("Goodbye!")
 }
