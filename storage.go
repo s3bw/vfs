@@ -1,4 +1,4 @@
-package main
+package vfs
 
 import (
 	"fmt"
@@ -6,76 +6,44 @@ import (
 	"path/filepath"
 	"time"
 
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
-// Database models
-type FileRecord struct {
-	ID        string    `gorm:"primaryKey"`
-	Name      string    `gorm:"not null"`
-	ParentID  *string   `gorm:"index"` // null for root-level items
-	IsDir     bool      `gorm:"not null"`
-	Color     string    `gorm:"default:''"`
-	CreatedAt time.Time `gorm:"autoCreateTime"`
-	UpdatedAt time.Time `gorm:"autoUpdateTime"`
-	Size      int64     `gorm:"default:0"`
+// Storage interface defines the contract for VFS storage backends
+type Storage interface {
+	CreateFile(node *Node, parentID *string) error
+	DeleteFile(fileID string) error
+	RenameFile(fileID string, newName string) error
+	GetFileContent(fileID string) (string, error)
+	SetFileContent(fileID string, content string) error
+	MoveFile(fileID string, newParentID *string) error
+	CopyFileContent(sourceID string, destID string) error
+	LoadVFSFromDB() (*VFS, error)
+	SaveVFSToDB(vfs *VFS) error
+	SaveDirectoryStates(vfs *VFS) error
 }
 
-// User preferences
-type UserPreference struct {
-	ID    uint   `gorm:"primaryKey"`
-	Key   string `gorm:"uniqueIndex;not null"`
-	Value string
-}
-
-// Directory state (sort, cursor)
-type DirectoryState struct {
-	ID        uint   `gorm:"primaryKey"`
-	Path      string `gorm:"uniqueIndex;not null"`
-	SortBy    int    `gorm:"default:0"` // 0=name, 1=created, 2=modified, 3=size
-	SortAsc   bool   `gorm:"default:true"`
-	CursorPos int    `gorm:"default:0"`
-}
-
-// Database manager
-type DB struct {
-	conn     *gorm.DB
+// GormStorage implements Storage using GORM
+type GormStorage struct {
+	db       *gorm.DB
 	filesDir string
 }
 
-// Initialize database and file storage
-func InitDB(dbPath string, filesDir string) (*DB, error) {
-	// Ensure directories exist
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(filesDir, 0755); err != nil {
-		return nil, err
-	}
-
-	// Open database
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
-	if err != nil {
-		return nil, err
-	}
-
-	// Auto-migrate schemas
-	if err := db.AutoMigrate(&FileRecord{}, &UserPreference{}, &DirectoryState{}); err != nil {
-		return nil, err
-	}
-
-	return &DB{
-		conn:     db,
+// NewGormStorage creates a new GORM storage backend
+func NewGormStorage(db *gorm.DB, filesDir string) *GormStorage {
+	// Ensure files directory exists
+	os.MkdirAll(filesDir, 0755)
+	return &GormStorage{
+		db:       db,
 		filesDir: filesDir,
-	}, nil
+	}
 }
 
 // LoadVFSFromDB loads the entire file tree from database
-func (db *DB) LoadVFSFromDB() (*VFS, error) {
+func (s *GormStorage) LoadVFSFromDB() (*VFS, error) {
 	// Load all file records
 	var records []FileRecord
-	if err := db.conn.Order("parent_id, is_dir DESC, name").Find(&records).Error; err != nil {
+	if err := s.db.Order("parent_id, is_dir DESC, name").Find(&records).Error; err != nil {
 		return nil, err
 	}
 
@@ -142,6 +110,7 @@ func (db *DB) LoadVFSFromDB() (*VFS, error) {
 		Root:       root,
 		Current:    root,
 		Stack:      []*Node{root},
+		storage:    s,
 		DirSortBy:  make(map[string]SortBy),
 		DirSortAsc: make(map[string]bool),
 		DirCursor:  make(map[string]int),
@@ -149,7 +118,7 @@ func (db *DB) LoadVFSFromDB() (*VFS, error) {
 
 	// Load directory states
 	var states []DirectoryState
-	if err := db.conn.Find(&states).Error; err == nil {
+	if err := s.db.Find(&states).Error; err == nil {
 		for _, state := range states {
 			vfs.DirSortBy[state.Path] = SortBy(state.SortBy)
 			vfs.DirSortAsc[state.Path] = state.SortAsc
@@ -161,18 +130,17 @@ func (db *DB) LoadVFSFromDB() (*VFS, error) {
 }
 
 // SaveVFSToDB saves the entire file tree to database
-func (db *DB) SaveVFSToDB(vfs *VFS) error {
-	return db.conn.Transaction(func(tx *gorm.DB) error {
-		// Recursively save all nodes
-		return db.saveNodeRecursive(tx, vfs.Root, nil)
+func (s *GormStorage) SaveVFSToDB(vfs *VFS) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		return s.saveNodeRecursive(tx, vfs.Root, nil)
 	})
 }
 
-func (db *DB) saveNodeRecursive(tx *gorm.DB, node *Node, parentID *string) error {
+func (s *GormStorage) saveNodeRecursive(tx *gorm.DB, node *Node, parentID *string) error {
 	// Skip root node
 	if node.ID == "root" {
 		for _, child := range node.Children {
-			if err := db.saveNodeRecursive(tx, child, nil); err != nil {
+			if err := s.saveNodeRecursive(tx, child, nil); err != nil {
 				return err
 			}
 		}
@@ -199,7 +167,7 @@ func (db *DB) saveNodeRecursive(tx *gorm.DB, node *Node, parentID *string) error
 	if node.IsDir {
 		nodeID := node.ID
 		for _, child := range node.Children {
-			if err := db.saveNodeRecursive(tx, child, &nodeID); err != nil {
+			if err := s.saveNodeRecursive(tx, child, &nodeID); err != nil {
 				return err
 			}
 		}
@@ -209,8 +177,8 @@ func (db *DB) saveNodeRecursive(tx *gorm.DB, node *Node, parentID *string) error
 }
 
 // SaveDirectoryStates saves all directory states (sort, cursor)
-func (db *DB) SaveDirectoryStates(vfs *VFS) error {
-	return db.conn.Transaction(func(tx *gorm.DB) error {
+func (s *GormStorage) SaveDirectoryStates(vfs *VFS) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
 		// Clear old states
 		if err := tx.Where("1 = 1").Delete(&DirectoryState{}).Error; err != nil {
 			return err
@@ -234,7 +202,7 @@ func (db *DB) SaveDirectoryStates(vfs *VFS) error {
 }
 
 // CreateFile creates a new file in the database and filesystem
-func (db *DB) CreateFile(node *Node, parentID *string) error {
+func (s *GormStorage) CreateFile(node *Node, parentID *string) error {
 	// Generate UUID for file
 	if node.ID == "" {
 		node.ID = generateUUID()
@@ -252,13 +220,13 @@ func (db *DB) CreateFile(node *Node, parentID *string) error {
 		UpdatedAt: time.Unix(node.Modified, 0),
 	}
 
-	if err := db.conn.Create(&record).Error; err != nil {
+	if err := s.db.Create(&record).Error; err != nil {
 		return err
 	}
 
 	// Create empty file if it's a .do file
 	if !node.IsDir {
-		filePath := filepath.Join(db.filesDir, node.ID+".do")
+		filePath := filepath.Join(s.filesDir, node.ID+".do")
 		if err := os.WriteFile(filePath, []byte(""), 0644); err != nil {
 			return err
 		}
@@ -267,55 +235,9 @@ func (db *DB) CreateFile(node *Node, parentID *string) error {
 	return nil
 }
 
-// CopyFile creates a copy of a file/folder with new UUID and optionally copies content
-// For folders, recursively copies all children
-func (db *DB) CopyFile(sourceNode *Node, parentID *string, copyContent bool) (*Node, error) {
-	// Create a new node with new UUID
-	newNode := &Node{
-		ID:        generateUUID(), // Generate new UUID
-		Name:      sourceNode.Name,
-		IsDir:     sourceNode.IsDir,
-		Color:     sourceNode.Color,
-		CreatedAt: time.Now().Unix(),
-		Modified:  time.Now().Unix(),
-		Size:      sourceNode.Size,
-		Children:  []*Node{},
-	}
-
-	// Create in database
-	if err := db.CreateFile(newNode, parentID); err != nil {
-		return nil, err
-	}
-
-	// If it's a file, copy content
-	if !sourceNode.IsDir && copyContent {
-		content, err := db.GetFileContent(sourceNode.ID)
-		if err == nil {
-			db.SetFileContent(newNode.ID, content)
-		}
-	}
-
-	// If it's a folder, recursively copy all children
-	if sourceNode.IsDir && sourceNode.Children != nil {
-		newNodeID := newNode.ID
-		for _, child := range sourceNode.Children {
-			// Recursively copy each child
-			copiedChild, err := db.CopyFile(child, &newNodeID, copyContent)
-			if err != nil {
-				// Log error but continue with other children
-				fmt.Fprintf(os.Stderr, "Warning: failed to copy child %s: %v\n", child.Name, err)
-				continue
-			}
-			newNode.Children = append(newNode.Children, copiedChild)
-		}
-	}
-
-	return newNode, nil
-}
-
 // DeleteFile deletes a file from database and filesystem
-func (db *DB) DeleteFile(fileID string) error {
-	return db.conn.Transaction(func(tx *gorm.DB) error {
+func (s *GormStorage) DeleteFile(fileID string) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
 		// Get file record
 		var record FileRecord
 		if err := tx.First(&record, "id = ?", fileID).Error; err != nil {
@@ -329,7 +251,7 @@ func (db *DB) DeleteFile(fileID string) error {
 
 		// Delete file from filesystem if it's not a directory
 		if !record.IsDir {
-			filePath := filepath.Join(db.filesDir, fileID+".do")
+			filePath := filepath.Join(s.filesDir, fileID+".do")
 			os.Remove(filePath) // Ignore error if file doesn't exist
 		}
 
@@ -338,15 +260,15 @@ func (db *DB) DeleteFile(fileID string) error {
 }
 
 // RenameFile renames a file in the database
-func (db *DB) RenameFile(fileID string, newName string) error {
-	return db.conn.Model(&FileRecord{}).
+func (s *GormStorage) RenameFile(fileID string, newName string) error {
+	return s.db.Model(&FileRecord{}).
 		Where("id = ?", fileID).
 		Update("name", newName).Error
 }
 
 // GetFileContent reads file content from filesystem
-func (db *DB) GetFileContent(fileID string) (string, error) {
-	filePath := filepath.Join(db.filesDir, fileID+".do")
+func (s *GormStorage) GetFileContent(fileID string) (string, error) {
+	filePath := filepath.Join(s.filesDir, fileID+".do")
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return "", err
@@ -355,12 +277,12 @@ func (db *DB) GetFileContent(fileID string) (string, error) {
 }
 
 // SetFileContent writes file content to filesystem
-func (db *DB) SetFileContent(fileID string, content string) error {
-	filePath := filepath.Join(db.filesDir, fileID+".do")
+func (s *GormStorage) SetFileContent(fileID string, content string) error {
+	filePath := filepath.Join(s.filesDir, fileID+".do")
 
 	// Update size in database
 	size := int64(len(content))
-	if err := db.conn.Model(&FileRecord{}).
+	if err := s.db.Model(&FileRecord{}).
 		Where("id = ?", fileID).
 		Updates(map[string]interface{}{
 			"size":       size,
@@ -372,9 +294,23 @@ func (db *DB) SetFileContent(fileID string, content string) error {
 	return os.WriteFile(filePath, []byte(content), 0644)
 }
 
-// Simple UUID generator (you might want to use github.com/google/uuid)
+// MoveFile moves a file to a new parent directory
+func (s *GormStorage) MoveFile(fileID string, newParentID *string) error {
+	return s.db.Model(&FileRecord{}).
+		Where("id = ?", fileID).
+		Update("parent_id", newParentID).Error
+}
+
+// CopyFileContent copies content from one file to another
+func (s *GormStorage) CopyFileContent(sourceID string, destID string) error {
+	content, err := s.GetFileContent(sourceID)
+	if err != nil {
+		return err
+	}
+	return s.SetFileContent(destID, content)
+}
+
+// generateUUID creates a simple timestamp-based UUID
 func generateUUID() string {
-	// Simple timestamp-based ID for demo
-	// In production, use: uuid.New().String()
 	return fmt.Sprintf("%d", time.Now().UnixNano())
 }

@@ -1,4 +1,4 @@
-module vfs-browser
+module github.com/s3bw/vfs
 
 go 1.21
 
