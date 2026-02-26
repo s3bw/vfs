@@ -12,6 +12,7 @@ type FileRecord struct {
 	CreatedAt time.Time `gorm:"autoCreateTime"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime"`
 	Size      int64     `gorm:"default:0"`
+	Deleted   bool      `gorm:"default:false"`
 }
 
 // UserPreference stores user preferences

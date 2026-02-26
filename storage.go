@@ -13,6 +13,9 @@ import (
 type Storage interface {
 	CreateFile(node *Node, parentID *string) error
 	DeleteFile(fileID string) error
+	HardDeleteFile(fileID string) error
+	RestoreFile(fileID string) error
+	GetDeletedFiles() ([]FileRecord, error)
 	RenameFile(fileID string, newName string) error
 	GetFileContent(fileID string) (string, error)
 	SetFileContent(fileID string, content string) error
@@ -41,9 +44,9 @@ func NewGormStorage(db *gorm.DB, filesDir string) *GormStorage {
 
 // LoadVFSFromDB loads the entire file tree from database
 func (s *GormStorage) LoadVFSFromDB() (*VFS, error) {
-	// Load all file records
+	// Load all non-deleted file records
 	var records []FileRecord
-	if err := s.db.Order("parent_id, is_dir DESC, name").Find(&records).Error; err != nil {
+	if err := s.db.Where("deleted = ?", false).Order("parent_id, is_dir DESC, name").Find(&records).Error; err != nil {
 		return nil, err
 	}
 
@@ -235,8 +238,15 @@ func (s *GormStorage) CreateFile(node *Node, parentID *string) error {
 	return nil
 }
 
-// DeleteFile deletes a file from database and filesystem
+// DeleteFile soft deletes a file by marking it as deleted
 func (s *GormStorage) DeleteFile(fileID string) error {
+	return s.db.Model(&FileRecord{}).
+		Where("id = ?", fileID).
+		Update("deleted", true).Error
+}
+
+// HardDeleteFile permanently deletes a file from database and filesystem
+func (s *GormStorage) HardDeleteFile(fileID string) error {
 	return s.db.Transaction(func(tx *gorm.DB) error {
 		// Get file record
 		var record FileRecord
@@ -299,6 +309,22 @@ func (s *GormStorage) MoveFile(fileID string, newParentID *string) error {
 	return s.db.Model(&FileRecord{}).
 		Where("id = ?", fileID).
 		Update("parent_id", newParentID).Error
+}
+
+// RestoreFile undeletes a soft-deleted file
+func (s *GormStorage) RestoreFile(fileID string) error {
+	return s.db.Model(&FileRecord{}).
+		Where("id = ?", fileID).
+		Update("deleted", false).Error
+}
+
+// GetDeletedFiles returns all soft-deleted files
+func (s *GormStorage) GetDeletedFiles() ([]FileRecord, error) {
+	var records []FileRecord
+	if err := s.db.Where("deleted = ?", true).Order("updated_at DESC").Find(&records).Error; err != nil {
+		return nil, err
+	}
+	return records, nil
 }
 
 // CopyFileContent copies content from one file to another
